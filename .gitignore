@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.part
+.venv/
+venv/
+.env
+.env.*
+*.key
+*api_key*
+*apikey*
+secrets/
+Audio/
