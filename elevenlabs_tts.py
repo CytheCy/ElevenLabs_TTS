@@ -107,6 +107,7 @@ class Job:
     retries: int
     retry_delay: float
     silence_seconds: float
+    end_silence_seconds: float
     overwrite: bool
     merge: bool
 
@@ -201,10 +202,37 @@ def chunk_text(text: str, limit: int) -> list[str]:
     return result
 
 
+def has_speakable_text(text: str) -> bool:
+    """Identify text with content beyond speaker labels, audio tags, and emojis."""
+    text = re.sub(
+        r"^\s*(?:\[\s*speaker\s*\d+\s*\]\s*:?"
+        r"|speaker\s*\d+\s*(?::|$))\s*",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\[[^\[\]\n]*\]", "", text)
+    text = re.sub(r"[0-9#*]\ufe0f?\u20e3", "", text)  # Keycap emojis contain ASCII digits.
+    return any(char.isalnum() for char in text)
+
+
 def make_chunks(markdown: str, max_chars: int) -> list[Chunk]:
     chunks: list[Chunk] = []
     for section, body in split_sections(markdown):
-        parts = chunk_text(body, max_chars)
+        spoken_lines: list[str] = []
+        pending_tags: list[str] = []
+        for line in body.splitlines():
+            line = line.strip()
+            if not has_speakable_text(line):
+                if (re.fullmatch(r"(?:\[[^\[\]\n]+\]\s*)+", line)
+                        and not re.search(r"\[\s*speaker\s*\d+\s*\]", line, re.IGNORECASE)):
+                    pending_tags.append(line)
+                continue
+            if pending_tags:
+                line = " ".join((*pending_tags, line))
+                pending_tags.clear()
+            spoken_lines.append(line)
+        if pending_tags and spoken_lines:
+            spoken_lines[-1] += " " + " ".join(pending_tags)
+        parts = chunk_text(" ".join(spoken_lines), max_chars)
         for index, part in enumerate(parts, 1):
             chunks.append(Chunk(section, index, part, index == len(parts)))
     return chunks
@@ -433,6 +461,19 @@ def merge_audio(paths: list[Path], destination: Path, output_format: str) -> Non
         list_path.unlink(missing_ok=True)
 
 
+def append_silence(path: Path, output_format: str, seconds: float) -> None:
+    """Add silence to a completed audio file without changing it on failure."""
+    if seconds <= 0:
+        return
+    with tempfile.TemporaryDirectory(dir=path.parent) as directory:
+        temporary = Path(directory)
+        silence = temporary / f"silence{path.suffix}"
+        combined = temporary / f"combined{path.suffix}"
+        create_silence(silence, output_format, seconds)
+        merge_audio([path, silence], combined, output_format)
+        combined.replace(path)
+
+
 def run_job(
     job: Job,
     cancel: threading.Event,
@@ -442,7 +483,7 @@ def run_job(
     key = read_api_key(job.api_key_file)
     chunks = make_chunks(job.source.read_text(encoding="utf-8-sig"), job.max_chars)
     if not chunks:
-        raise ValueError("The Markdown source file contains no text.")
+        raise ValueError("The Markdown source file contains no speakable text.")
     job.output_dir.mkdir(parents=True, exist_ok=True)
     client = ElevenLabsClient(key, job, cancel)
     if not supports_request_stitching(job.model_id) and (
@@ -476,6 +517,7 @@ def run_job(
                 chunk.text, destination, previous_text=prior, next_text=following,
                 previous_request_ids=tuple(generated_request_ids) if job.stitch_request_ids else job.previous_request_ids,
             )
+            append_silence(destination, job.output_format, job.end_silence_seconds)
             if request_id and job.stitch_request_ids:
                 generated_request_ids.append(request_id)
                 generated_request_ids = generated_request_ids[-3:]

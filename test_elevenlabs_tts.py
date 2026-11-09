@@ -11,13 +11,16 @@ from elevenlabs_tts import (
     ElevenLabsClient,
     Job,
     VoiceSettings,
+    append_silence,
     chunk_text,
     fetch_voices,
+    has_speakable_text,
     make_chunks,
     output_extension,
     parse_id_list,
     read_api_key,
     require_external_path,
+    run_job,
     supports_request_stitching,
     split_sections,
 )
@@ -53,6 +56,7 @@ def sample_job(directory: Path, **changes):
         retries=0,
         retry_delay=0,
         silence_seconds=0,
+        end_silence_seconds=0,
         overwrite=False,
         merge=False,
     )
@@ -82,6 +86,43 @@ class TextProcessingTests(unittest.TestCase):
         chunks = make_chunks("# 3 Test\nOne. Two.", 5)
         self.assertEqual(3, chunks[0].section)
         self.assertTrue(chunks[-1].ends_section)
+
+    def test_prose_lines_share_audio_part_up_to_limit(self):
+        markdown = "# 01 First\n" + "\n".join(f"Line {i}." for i in range(1, 7))
+        chunks = make_chunks(markdown, 400)
+        self.assertEqual([" ".join(f"Line {i}." for i in range(1, 7))],
+                         [chunk.text for chunk in chunks])
+        self.assertEqual([1], [chunk.index for chunk in chunks])
+        self.assertEqual([True], [chunk.ends_section for chunk in chunks])
+
+    def test_prose_lines_split_only_at_character_limit(self):
+        chunks = make_chunks("# 01 First\nFirst sentence. Second sentence.\nLast line.", 20)
+        self.assertEqual(["First sentence.", "Second sentence.", "Last line."],
+                         [chunk.text for chunk in chunks])
+        self.assertTrue(all(len(chunk.text) <= 20 for chunk in chunks))
+
+    def test_heading_still_starts_new_section(self):
+        chunks = make_chunks("# 01 First\nOne.\nTwo.\n# 02 Second\nThree.", 400)
+        self.assertEqual([(1, 1, "One. Two."), (2, 1, "Three.")],
+                         [(chunk.section, chunk.index, chunk.text) for chunk in chunks])
+
+    def test_non_speech_lines_do_not_become_api_requests(self):
+        markdown = "# 01 First\nSpeaker 1:\n😀\n1️⃣\nHello.\n[Speaker 2]: 👋\n[Speaker 3]\n[laughs] Goodbye."
+        chunks = make_chunks(markdown, 400)
+        self.assertEqual(["Hello. [laughs] Goodbye."], [chunk.text for chunk in chunks])
+        self.assertEqual([1], [chunk.index for chunk in chunks])
+        self.assertEqual([True], [chunk.ends_section for chunk in chunks])
+        self.assertTrue(has_speakable_text("Speaker 1: [laughs] Hello"))
+        self.assertFalse(has_speakable_text("[laughs]"))
+        self.assertFalse(has_speakable_text("Speaker 1: 👋"))
+        self.assertFalse(has_speakable_text("[Speaker 3]"))
+
+    def test_standalone_audio_tag_attaches_to_next_spoken_chunk(self):
+        markdown = "# 10 Scene\nFirst paragraph.\n[long pause]\nSecond paragraph."
+        chunks = make_chunks(markdown, 400)
+        self.assertEqual(["First paragraph. [long pause] Second paragraph."],
+                         [chunk.text for chunk in chunks])
+        self.assertEqual([1], [chunk.index for chunk in chunks])
 
     def test_all_documented_formats_and_extensions(self):
         self.assertEqual(28, len(OUTPUT_FORMATS))
@@ -202,6 +243,30 @@ class ApiTests(unittest.TestCase):
         voices = fetch_voices("secret")
         self.assertEqual(["one", "two"], [item["voice_id"] for item in voices])
         self.assertEqual("page-two", get.call_args_list[1].kwargs["params"]["next_page_token"])
+
+
+class AudioOutputTests(unittest.TestCase):
+    @patch("elevenlabs_tts.read_api_key", return_value="test-key")
+    def test_end_silence_is_added_to_each_chunk_and_merged_audio(self, _read_key):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job = sample_job(root, output_format="pcm_8000", max_chars=8,
+                             end_silence_seconds=0.2, merge=True)
+            job.source.write_text("# 01 Chapter\nHello. Goodbye.", encoding="utf-8")
+
+            def synthesize(_client, _text, destination, **_kwargs):
+                destination.write_bytes(b"\x01\x00" * 4)
+                return None
+
+            with patch.object(ElevenLabsClient, "synthesize", synthesize):
+                products = run_job(job, threading.Event(), lambda _message: None,
+                                   lambda _current, _total: None)
+
+            self.assertEqual(3, len(products))
+            expected = b"\x01\x00" * 4 + b"\x00\x00" * 1600
+            self.assertEqual(expected, products[0].read_bytes())
+            self.assertEqual(expected, products[1].read_bytes())
+            self.assertEqual(expected * 2, products[2].read_bytes())
 
 
 if __name__ == "__main__":

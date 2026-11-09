@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import tkinter as tk
@@ -242,7 +243,7 @@ class ElevenLabsTTSApp(tk.Tk):
         workflow = ttk.LabelFrame(self.form, text="Batch workflow", padding=10)
         workflow.pack(fill="x", pady=8)
         workflow_fields = (
-            ("Max characters/request", "max_chars", "5000"),
+            ("Max characters/request", "max_chars", "400"),
             ("Timeout (seconds)", "timeout", "180"),
             ("Retries", "retries", "2"),
             ("Retry delay (seconds)", "retry_delay", "2"),
@@ -254,12 +255,18 @@ class ElevenLabsTTSApp(tk.Tk):
                 row=1, column=column, sticky="ew", padx=(0, 8),
             )
             workflow.columnconfigure(column, weight=1)
+        ttk.Label(workflow, text="End-of-file silence (seconds; 0 = off)").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0),
+        )
+        ttk.Entry(workflow, textvariable=self.variable("end_silence", "0"), width=13).grid(
+            row=2, column=2, sticky="w", pady=(8, 0),
+        )
         ttk.Checkbutton(
             workflow, text="Overwrite existing files", variable=self.variable("overwrite", False, tk.BooleanVar),
-        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
             workflow, text="Create one merged audio file", variable=self.variable("merge", False, tk.BooleanVar),
-        ).grid(row=2, column=2, columnspan=2, sticky="w", pady=(8, 0))
+        ).grid(row=3, column=2, columnspan=2, sticky="w", pady=(8, 0))
 
         actions = ttk.Frame(self.form)
         actions.pack(fill="x", pady=8)
@@ -287,7 +294,13 @@ class ElevenLabsTTSApp(tk.Tk):
     def _load_settings(self) -> dict[str, object]:
         try:
             value = json.loads(self._settings_path().read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
+            if not isinstance(value, dict):
+                return {}
+            # The old default was 5000. Move existing installs to the new
+            # prose-sized default once, while preserving later user edits.
+            if value.get("chunk_default_version") != 2 and value.get("max_chars") == "5000":
+                value["max_chars"] = "400"
+            return value
         except (OSError, ValueError, AttributeError):
             return {}
 
@@ -297,6 +310,7 @@ class ElevenLabsTTSApp(tk.Tk):
             path.parent.mkdir(parents=True, exist_ok=True)
             # These are GUI choices and an optional path only. The key itself is never persisted.
             settings = {name: variable.get() for name, variable in self.vars.items()}
+            settings["chunk_default_version"] = 2
             temporary = path.with_suffix(".tmp")
             temporary.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
             temporary.replace(path)
@@ -499,8 +513,10 @@ class ElevenLabsTTSApp(tk.Tk):
         retries = int(str(self.vars["retries"].get()))
         retry_delay = float(str(self.vars["retry_delay"].get()))
         silence = float(str(self.vars["silence"].get()))
-        if retries < 0 or retry_delay < 0 or silence < 0:
-            raise ValueError("Retries, retry delay, and section silence cannot be negative.")
+        end_silence = float(str(self.vars["end_silence"].get()))
+        if retries < 0 or any(not math.isfinite(value) or value < 0
+                              for value in (retry_delay, silence, end_silence)):
+            raise ValueError("Retries, retry delay, section silence, and end-of-file silence must be nonnegative finite numbers.")
 
         seed_text = str(self.vars["seed"].get()).strip()
         seed = int(seed_text) if seed_text else None
@@ -559,6 +575,7 @@ class ElevenLabsTTSApp(tk.Tk):
             retries=retries,
             retry_delay=retry_delay,
             silence_seconds=silence,
+            end_silence_seconds=end_silence,
             overwrite=bool(self.vars["overwrite"].get()),
             merge=bool(self.vars["merge"].get()),
         )
